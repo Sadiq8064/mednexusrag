@@ -1,8 +1,11 @@
 fastapi
 uvicorn
-sentence-transformers
-torch
 faiss-cpu
+sentence-transformers
 numpy
 pydantic
 gdown
+
+# CPU-only torch (Railway compatible)
+torch==2.2.0+cpu
+--extra-index-url https://download.pytorch.org/whl/cpu
