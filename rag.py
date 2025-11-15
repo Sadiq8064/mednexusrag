@@ -6,14 +6,16 @@ import numpy as np
 import faiss
 import torch
 import gdown
+import re
 
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
+from sklearn.metrics.pairwise import cosine_similarity
 from sentence_transformers import SentenceTransformer, CrossEncoder
 
-# ==========================
+# ============================================================
 # Environment + Paths
-# ==========================
+# ============================================================
 DATA_DIR = "/app/data"
 os.makedirs(DATA_DIR, exist_ok=True)
 
@@ -28,21 +30,19 @@ PUB_META_PATH  = os.path.join(DATA_DIR, "pubmed_meta.pkl")
 MED_INDEX_PATH = os.path.join(DATA_DIR, "medquad_index.faiss")
 MED_META_PATH  = os.path.join(DATA_DIR, "medquad_meta.pkl")
 
-# ==========================
+# ============================================================
 # Google Drive downloader
-# ==========================
+# ============================================================
 def download_file(url, dest_path):
-    """Download from GDrive ID-based URL."""
     if os.path.exists(dest_path) and os.path.getsize(dest_path) > 0:
         print(f"[skip] already exists: {dest_path}")
         return
 
     if not url:
-        raise RuntimeError(f"Missing URL for {dest_path}")
+        raise RuntimeError(f"Missing URL for: {dest_path}")
 
-    print(f"[gdown] downloading: {url}")
+    print(f"[gdown] downloading GDrive file: {url}")
 
-    # Extract Google Drive file ID from URL
     try:
         file_id = url.strip().split("/d/")[1].split("/")[0]
     except:
@@ -55,10 +55,9 @@ def download_file(url, dest_path):
             os.remove(dest_path)
         raise RuntimeError(f"gdown failed: {e}")
 
-
-# ==========================
-# Download dataset files once
-# ==========================
+# ============================================================
+# Download data files once
+# ============================================================
 try:
     download_file(PUBMED_INDEX_URL, PUB_INDEX_PATH)
     download_file(PUBMED_META_URL,  PUB_META_PATH)
@@ -68,9 +67,9 @@ except Exception as e:
     print(f"[startup error] {e}", file=sys.stderr)
     raise
 
-# ==========================
-# Device & Models
-# ==========================
+# ============================================================
+# Device + Models (Safe Torch Version)
+# ============================================================
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Using device: {device}")
 
@@ -84,39 +83,66 @@ cross_encoder = CrossEncoder(
     device=device
 )
 
-# ==========================
-# Load FAISS index + metadata
-# ==========================
+# ============================================================
+# Load FAISS + Metadata
+# ============================================================
 def load_index_and_meta(index_path, meta_path, name):
-    print(f"Loading FAISS index: {index_path}")
+    print(f"Loading index: {index_path}")
     index = faiss.read_index(index_path)
 
     with open(meta_path, "rb") as f:
         data = pickle.load(f)
 
     texts, meta = data["texts"], data["meta"]
-    print(f"Loaded {len(texts)} entries for {name}")
-
+    print(f"{name}: Loaded {len(texts)} entries")
     return index, texts, meta
-
 
 pub_index, pub_texts, pub_meta = load_index_and_meta(PUB_INDEX_PATH, PUB_META_PATH, "PubMedQA")
 med_index, med_texts, med_meta = load_index_and_meta(MED_INDEX_PATH, MED_META_PATH, "MedQuAD")
 
+# ============================================================
+# RAG v2 Utilities
+# ============================================================
+def softmax(xs):
+    e = np.exp(np.array(xs) - np.max(xs))
+    return (e / e.sum()).tolist()
 
-# ==========================
-# Improved RAG Search
-# ==========================
-def improved_rag_search(query, top_k_faiss=30, top_k_rerank=5):
-    """Higher-quality RAG: large FAISS search + cross-encoder rerank + answer fusion."""
+def sentence_tokenize(text):
+    parts = re.split(r'(?<=[\.\?\!])\s+', text.strip())
+    return [p.strip() for p in parts if p.strip()]
 
+def dedupe_sentences(sentences, threshold=0.88):
+    if not sentences:
+        return []
+    s_embs = embedder.encode(
+        sentences,
+        convert_to_numpy=True,
+        normalize_embeddings=True
+    ).astype("float32")
+
+    keep = []
+    used = np.zeros(len(sentences), dtype=bool)
+
+    for i, emb in enumerate(s_embs):
+        if used[i]:
+            continue
+        keep.append(sentences[i])
+        sims = np.dot(s_embs, emb)
+        used = np.logical_or(used, sims >= threshold)
+
+    return keep
+
+# ============================================================
+# Improved RAG v2 Pipeline
+# ============================================================
+def improved_rag_search_v2(query, top_k_faiss=50, top_k_rerank=12, fuse_sentences=7):
     q_emb = embedder.encode(
         [query],
         convert_to_numpy=True,
         normalize_embeddings=True
     ).astype("float32")
 
-    # ---------- FAISS SEARCH ----------
+    # ---- FAISS Search ----
     def faiss_search(index, texts, meta):
         sims, idxs = index.search(q_emb, top_k_faiss)
         idxs = idxs[0]
@@ -124,77 +150,98 @@ def improved_rag_search(query, top_k_faiss=30, top_k_rerank=5):
 
     pub_candidates = faiss_search(pub_index, pub_texts, pub_meta)
     med_candidates = faiss_search(med_index, med_texts, med_meta)
-
     all_candidates = pub_candidates + med_candidates
 
-    # ---------- CROSS ENCODER RERANK ----------
-    pairs = [(query, text) for (_, text, _) in all_candidates]
-    scores = cross_encoder.predict(pairs)
+    # ---- Cross-Encoder Rerank ----
+    ce_pairs = [(query, text) for (_, text, _) in all_candidates]
+    ce_scores = cross_encoder.predict(ce_pairs)
 
-    results = []
-    for (idx, text, meta), score in zip(all_candidates, scores):
-        results.append({
+    # ---- Cosine Scores ----
+    texts = [t for (_, t, _) in all_candidates]
+    p_embs = embedder.encode(
+        texts,
+        convert_to_numpy=True,
+        normalize_embeddings=True
+    ).astype("float32")
+
+    cos_sims = (np.dot(p_embs, q_emb[0]) + 1.0) / 2.0
+
+    # ---- Combine CE + Cosine ----
+    ce_arr = np.array(ce_scores)
+    if ce_arr.max() != ce_arr.min():
+        ce_norm = (ce_arr - ce_arr.min()) / (ce_arr.max() - ce_arr.min())
+    else:
+        ce_norm = np.ones_like(ce_arr)
+
+    w_ce = 0.7
+    w_cos = 0.3
+    combined = (w_ce * ce_norm) + (w_cos * np.array(cos_sims))
+
+    # ---- Select Top rerank ----
+    order = np.argsort(-combined)[:top_k_rerank]
+    selected = []
+    for idx in order:
+        i, text, meta = all_candidates[idx]
+        selected.append({
             "text": text,
-            "score": float(score),
             "long_answer": meta.get("long_answer", "").strip(),
             "final_decision": meta.get("final_decision", "").strip(),
-            "source": "PubMedQA" if meta in pub_meta else "MedQuAD"
+            "source": "PubMedQA" if meta in pub_meta else "MedQuAD",
+            "ce_score": float(ce_scores[idx]),
+            "cos_sim": float(cos_sims[idx]),
+            "combined_score": float(combined[idx])
         })
 
-    results = sorted(results, key=lambda x: x["score"], reverse=True)
-    top_results = results[:top_k_rerank]
+    # ---- Build Sentences to Fuse ----
+    all_sentences = []
+    for r in selected:
+        raw = r["long_answer"] or r["text"]
+        sents = sentence_tokenize(raw)
+        all_sentences.extend(sents)
 
-    # ---------- ANSWER FUSION ----------
-    fused_answer = " ".join(
-        [r["long_answer"] for r in top_results if len(r["long_answer"]) > 5]
-    ).strip()
+    all_sentences = all_sentences[: fuse_sentences * 4]
+    deduped = dedupe_sentences(all_sentences)
+    fused = " ".join(deduped[:fuse_sentences]).strip()
 
-    if not fused_answer:
-        fused_answer = top_results[0]["text"]  # fallback
+    if not fused:
+        fused = selected[0]["long_answer"] or selected[0]["text"]
 
-    # Safety check
-    if top_results[0]["score"] < 0.2:
-        fused_answer = "No confident medical answer found in the dataset."
+    # ---- Confidence ----
+    conf = softmax([r["combined_score"] for r in selected])[0]
+
+    if conf < 0.08:
+        fused = "No confident medical answer found in the dataset."
 
     return {
         "question": query,
-        "best_score": top_results[0]["score"],
-        "source": top_results[0]["source"],
-        "answer": fused_answer,
-        "top_passages_used": len(top_results)
+        "answer": fused,
+        "confidence": conf,
+        "source": selected[0]["source"],
+        "top_passages": selected[:5]
     }
 
+# ============================================================
+# FastAPI Server
+# ============================================================
+app = FastAPI(title="MedNexus Medical RAG v2")
 
-# ==========================
-# FastAPI App
-# ==========================
-app = FastAPI(title="MedNexus Medical RAG (Improved)")
+class Query(BaseModel):
+    question: str
 
 def check_api_key(request: Request):
-    if API_KEY:
-        if request.headers.get("x-api-key") != API_KEY:
-            raise HTTPException(status_code=401, detail="Invalid API key")
+    if API_KEY and request.headers.get("x-api-key") != API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid API Key")
 
-
-# ---- Health route ----
 @app.get("/health")
 def health():
     return {"status": "ok", "device": device}
 
-
-# ---- GET route (browser testing) ----
 @app.get("/ask")
 def ask_get(q: str, request: Request):
-    """Allows testing RAG directly in browser via GET /ask?q=your-question"""
     check_api_key(request)
-    return improved_rag_search(q.strip())
-
-
-# ---- POST route (API usage) ----
-class Query(BaseModel):
-    question: str
+    return improved_rag_search_v2(q.strip())
 
 @app.post("/ask")
-def ask_post(payload: Query, request: Request):
+def ask_post(body: Query, request: Request):
     check_api_key(request)
-    return improved_rag_search(payload.question.strip())
+    return improved_rag_search_v2(body.question.strip())
