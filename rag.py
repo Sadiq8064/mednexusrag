@@ -26,7 +26,8 @@ GEMINI_KEY = os.getenv("GEMINI_API_KEY")
 CE_THRESHOLD = float(os.getenv("CE_THRESHOLD", "5.0"))
 
 genai.configure(api_key=GEMINI_KEY)
-gemini_model = genai.GenerativeModel("gemini-pro")
+
+gemini_model = genai.GenerativeModel("gemini-2.5-flash")
 
 PUB_INDEX_PATH = f"{DATA_DIR}/pubmed_index.faiss"
 PUB_META_PATH  = f"{DATA_DIR}/pubmed_meta.pkl"
