@@ -1,6 +1,7 @@
 # rag.py
 import os
 import sys
+import json
 import gdown
 import pickle
 import faiss
@@ -26,7 +27,6 @@ GEMINI_KEY = os.getenv("GEMINI_API_KEY")
 CE_THRESHOLD = float(os.getenv("CE_THRESHOLD", "5.0"))
 
 genai.configure(api_key=GEMINI_KEY)
-
 gemini_model = genai.GenerativeModel("gemini-2.5-flash")
 
 PUB_INDEX_PATH = f"{DATA_DIR}/pubmed_index.faiss"
@@ -34,15 +34,22 @@ PUB_META_PATH  = f"{DATA_DIR}/pubmed_meta.pkl"
 MED_INDEX_PATH = f"{DATA_DIR}/medquad_index.faiss"
 MED_META_PATH  = f"{DATA_DIR}/medquad_meta.pkl"
 
+
 # ============================================================
-# Helper: download GDrive
+# Google Drive downloader
 # ============================================================
 def download_from_drive(url, dest):
     if os.path.exists(dest) and os.path.getsize(dest) > 0:
         print(f"[skip] {dest}")
         return
-    file_id = url.split("/d/")[1].split("/")[0]
+
+    try:
+        file_id = url.split("/d/")[1].split("/")[0]
+    except Exception:
+        raise RuntimeError(f"Invalid Google Drive URL: {url}")
+
     gdown.download(id=file_id, output=dest, quiet=False)
+
 
 for url, path in [
     (PUBMED_INDEX_URL, PUB_INDEX_PATH),
@@ -50,21 +57,27 @@ for url, path in [
     (MED_INDEX_URL,    MED_INDEX_PATH),
     (MED_META_URL,     MED_META_PATH),
 ]:
-    try:
-        download_from_drive(url, path)
-    except Exception as e:
-        print(f"[startup error] {e}")
-        raise
+    download_from_drive(url, path)
+
 
 # ============================================================
-# Model setup
+# Models
 # ============================================================
 device = "cuda" if torch.cuda.is_available() else "cpu"
-embedder = SentenceTransformer("pritamdeka/S-BioBert-snli-multinli-stsb", device=device)
-cross_encoder = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2", device=device)
+
+embedder = SentenceTransformer(
+    "pritamdeka/S-BioBert-snli-multinli-stsb",
+    device=device
+)
+
+cross_encoder = CrossEncoder(
+    "cross-encoder/ms-marco-MiniLM-L-6-v2",
+    device=device
+)
+
 
 # ============================================================
-# Load FAISS + meta
+# Load FAISS + metadata
 # ============================================================
 def load_index_meta(index_path, meta_path):
     index = faiss.read_index(index_path)
@@ -72,80 +85,119 @@ def load_index_meta(index_path, meta_path):
         data = pickle.load(f)
     return index, data["texts"], data["meta"]
 
+
 pub_index, pub_texts, pub_meta = load_index_meta(PUB_INDEX_PATH, PUB_META_PATH)
 med_index, med_texts, med_meta = load_index_meta(MED_INDEX_PATH, MED_META_PATH)
 
+
 # ============================================================
-# Core RAG
+# RAG Search
 # ============================================================
 def rag_search(query, top_k=40):
-    q_emb = embedder.encode([query], convert_to_numpy=True, normalize_embeddings=True).astype("float32")
+    q_emb = embedder.encode(
+        [query],
+        convert_to_numpy=True,
+        normalize_embeddings=True
+    ).astype("float32")
 
-    # PubMed
     sims_pub, idx_pub = pub_index.search(q_emb, top_k)
-    pub_hits = [(idx_pub[0][i], sims_pub[0][i], pub_texts[idx_pub[0][i]], pub_meta[idx_pub[0][i]], "PubMedQA")
-                for i in range(top_k)]
+    pub_hits = [
+        (idx_pub[0][i], sims_pub[0][i], pub_texts[idx_pub[0][i]], pub_meta[idx_pub[0][i]], "PubMedQA")
+        for i in range(top_k)
+    ]
 
-    # MedQuAD
     sims_med, idx_med = med_index.search(q_emb, top_k)
-    med_hits = [(idx_med[0][i], sims_med[0][i], med_texts[idx_med[0][i]], med_meta[idx_med[0][i]], "MedQuAD")
-                for i in range(top_k)]
+    med_hits = [
+        (idx_med[0][i], sims_med[0][i], med_texts[idx_med[0][i]], med_meta[idx_med[0][i]], "MedQuAD")
+        for i in range(top_k)
+    ]
 
     all_hits = pub_hits + med_hits
-
     ce_inputs = [(query, h[2]) for h in all_hits]
     ce_scores = cross_encoder.predict(ce_inputs)
 
     best_idx = int(np.argmax(ce_scores))
     best_score = float(ce_scores[best_idx])
-    _, _, _, best_meta, source = all_hits[best_idx]
 
     if best_score < CE_THRESHOLD:
-        return None, None  # weak → use Gemini
+        return None, None
 
+    _, _, _, best_meta, source = all_hits[best_idx]
     answer = best_meta.get("long_answer") or best_meta.get("answer") or ""
     return answer.strip(), source
 
 
 # ============================================================
-# Gemini unified call
+# Gemini classifier + context generator
 # ============================================================
-def gemini_medical_classifier_and_context(question):
-    prompt = f"""
-You are a strict medical classifier + context generator.
+def gemini_medical_classifier_and_context(question: str):
+    system_prompt = f"""
+You are a strict medical classifier and medical-textbook context generator.  
+Always return ONLY JSON. NEVER include any explanation, reasoning, markdown, commentary, or extra text.
 
-1. First determine if the user question is truly MEDICAL. 
-2. If it is NOT medical:
-    - Respond ONLY with JSON:
-      {{"is_medical": false}}
-3. If it IS medical:
-    - Generate ONE PARAGRAPH (120–200 words) written like a medical textbook.
-    - The paragraph MUST contain the correct answer naturally inside it.
-    - It should not look like AI content.
-    - Do NOT give bullet points.
-    - Do NOT say "As an AI".
-    - Respond ONLY as JSON in this format:
+Your tasks:
 
-      {{
-        "is_medical": true,
-        "context": "<paragraph>"
-      }}
+1. Determine if the question is a true MEDICAL QUESTION based on:
+   - diseases
+   - anatomy
+   - physiology
+   - symptoms
+   - diagnostics
+   - treatment
+   - pharmacology
+   - pathology
+   - anything clinically relevant
+
+2. If it is NOT a medical question:
+   {{
+     "is_medical": false
+   }}
+
+3. If it IS a medical question:
+   Generate a single paragraph (120–200 words) written in the style of a medical textbook.
+   The paragraph must:
+   - include the correct answer organically within the paragraph
+   - contain supporting medical context around the answer
+   - read like a natural excerpt from a clinical reference book
+   - avoid bullet points
+   - avoid AI-like wording
+   - feel like real textbook content
+
+Return strictly in this JSON format:
+{{
+  "is_medical": true,
+  "context": "<textbook style paragraph>"
+}}
 
 User question: "{question}"
 """
 
-    response = gemini_model.generate_content(prompt).text
-    return response
+    try:
+        resp = gemini_model.generate_content(system_prompt)
+
+        raw = resp.candidates[0].content.parts[0].text.strip()
+        cleaned = raw.replace("```json", "").replace("```", "").strip()
+
+        try:
+            data = json.loads(cleaned)
+        except:
+            return {"is_medical": False, "error": "Failed to parse JSON"}
+
+        return data
+
+    except Exception as e:
+        return {"is_medical": False, "error": str(e)}
 
 
 # ============================================================
-# FastAPI
+# FastAPI app
 # ============================================================
 app = FastAPI()
 
 def verify_key(request: Request):
     if API_KEY and request.headers.get("x-api-key") != API_KEY:
-        raise HTTPException(401, "Invalid API key")
+        raise HTTPException(status_code=401, detail="Invalid API key")
+
 
 @app.get("/ask")
 def ask(question: str, request: Request):
@@ -155,12 +207,9 @@ def ask(question: str, request: Request):
     if not question:
         raise HTTPException(400, "Question cannot be empty")
 
-    # -------------------------------
-    # 1. Try RAG (high confidence)
-    # -------------------------------
     rag_answer, rag_source = rag_search(question)
 
-    if rag_answer:  # RAG succeeded
+    if rag_answer:
         return {
             "question": question,
             "answer": rag_answer,
@@ -168,22 +217,9 @@ def ask(question: str, request: Request):
             "is_medical": True
         }
 
-    # -------------------------------
-    # 2. RAG weak → use Gemini (single call)
-    # -------------------------------
     gem = gemini_medical_classifier_and_context(question)
 
-    try:
-        gem_json = eval(gem)  # Gemini returns JSON text
-    except:
-        return {
-            "question": question,
-            "answer": "Failed to parse Gemini output.",
-            "source": None,
-            "is_medical": False
-        }
-
-    if gem_json.get("is_medical") is False:
+    if gem.get("is_medical") is False:
         return {
             "question": question,
             "answer": "This question is not medical.",
@@ -191,10 +227,9 @@ def ask(question: str, request: Request):
             "is_medical": False
         }
 
-    # Medical → return context
     return {
         "question": question,
-        "answer": gem_json.get("context", ""),
+        "answer": gem.get("context", ""),
         "source": "MedBooks",
         "is_medical": True
     }
