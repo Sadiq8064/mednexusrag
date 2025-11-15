@@ -9,6 +9,7 @@ import pickle
 import numpy as np
 import torch
 from sentence_transformers import SentenceTransformer, CrossEncoder
+import gdown
 
 # ====================
 # Config & env
@@ -16,16 +17,13 @@ from sentence_transformers import SentenceTransformer, CrossEncoder
 DATA_DIR = "/app/data"
 os.makedirs(DATA_DIR, exist_ok=True)
 
-# Google Drive direct-download URLs must be provided as Railway variables
 PUBMED_INDEX_URL = os.getenv("PUBMED_INDEX_URL")
 PUBMED_META_URL  = os.getenv("PUBMED_META_URL")
 MED_INDEX_URL    = os.getenv("MED_INDEX_URL")
 MED_META_URL     = os.getenv("MED_META_URL")
 
-# Optional API key protection
-API_KEY = os.getenv("API_KEY")  # set this in Railway variables if you want protection
+API_KEY = os.getenv("API_KEY")
 
-# Local file paths (in persistent volume)
 PUB_INDEX_PATH = os.path.join(DATA_DIR, "pubmed_index.faiss")
 PUB_META_PATH  = os.path.join(DATA_DIR, "pubmed_meta.pkl")
 MED_INDEX_PATH = os.path.join(DATA_DIR, "medquad_index.faiss")
@@ -34,33 +32,32 @@ MED_META_PATH  = os.path.join(DATA_DIR, "medquad_meta.pkl")
 # ====================
 # Helper: download once
 # ====================
-def download_file(url: str, dest_path: str, chunk_size: int = 32768):
-    if not url:
-        raise ValueError(f"Missing URL for {dest_path}. Set the appropriate environment variable.")
+def download_file(url, dest_path):
     if os.path.exists(dest_path) and os.path.getsize(dest_path) > 0:
         print(f"[skip] already exists: {dest_path}")
         return
-    print(f"[download] from {url} -> {dest_path}")
-    # stream download
+
+    if not url:
+        raise RuntimeError(f"Missing URL for {dest_path}")
+
+    print(f"[gdown] downloading: {url}")
+
+    # Extract Google Drive file ID
     try:
-        with requests.get(url, stream=True, timeout=300) as r:
-            r.raise_for_status()
-            with open(dest_path, "wb") as f:
-                for chunk in r.iter_content(chunk_size=chunk_size):
-                    if chunk:
-                        f.write(chunk)
-        print(f"[done] {dest_path}")
+        file_id = url.strip().split("/d/")[1].split("/")[0]
+    except:
+        raise RuntimeError(f"Invalid Google Drive URL: {url}")
+
+    try:
+        gdown.download(id=file_id, output=dest_path, quiet=False)
     except Exception as e:
-        # remove partial file if exists
         if os.path.exists(dest_path):
-            try:
-                os.remove(dest_path)
-            except Exception:
-                pass
-        raise RuntimeError(f"Failed to download {url}: {e}")
+            os.remove(dest_path)
+        raise RuntimeError(f"gdown failed: {e}")
+
 
 # ====================
-# Download files if missing (only runs at startup)
+# Download files if missing
 # ====================
 try:
     download_file(PUBMED_INDEX_URL, PUB_INDEX_PATH)
@@ -68,7 +65,6 @@ try:
     download_file(MED_INDEX_URL,    MED_INDEX_PATH)
     download_file(MED_META_URL,     MED_META_PATH)
 except Exception as e:
-    # Fail fast - logs will show error in Railway
     print(f"[startup error] {e}", file=sys.stderr)
     raise
 
@@ -144,7 +140,6 @@ def health():
 
 @app.post("/ask")
 def ask(req: QueryRequest, request: Request):
-    # API key protection (optional)
     check_api_key(request)
 
     q = req.question.strip()
