@@ -16,6 +16,8 @@ sentence-transformers==2.7.0
 
 # Transformers pinned for stability
 transformers==4.38.0
+google-generativeai
+
 
 # Other deps
 pydantic
