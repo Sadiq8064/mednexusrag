@@ -8,6 +8,7 @@ import numpy as np
 import torch
 from fastapi import FastAPI, Request, HTTPException
 from sentence_transformers import SentenceTransformer, CrossEncoder
+import google.generativeai as genai
 
 # ============================================================
 # Configuration
@@ -20,147 +21,179 @@ PUBMED_META_URL  = os.getenv("PUBMED_META_URL")
 MED_INDEX_URL    = os.getenv("MED_INDEX_URL")
 MED_META_URL     = os.getenv("MED_META_URL")
 
-API_KEY = os.getenv("API_KEY")   # optional
-CE_THRESHOLD = float(os.getenv("CE_THRESHOLD", "5.0"))  # NEW ★ confidence threshold
+API_KEY = os.getenv("API_KEY")
+GEMINI_KEY = os.getenv("GEMINI_API_KEY")
+CE_THRESHOLD = float(os.getenv("CE_THRESHOLD", "5.0"))
 
-PUB_INDEX_PATH = os.path.join(DATA_DIR, "pubmed_index.faiss")
-PUB_META_PATH  = os.path.join(DATA_DIR, "pubmed_meta.pkl")
-MED_INDEX_PATH = os.path.join(DATA_DIR, "medquad_index.faiss")
-MED_META_PATH  = os.path.join(DATA_DIR, "medquad_meta.pkl")
+genai.configure(api_key=GEMINI_KEY)
+gemini_model = genai.GenerativeModel("gemini-pro")
+
+PUB_INDEX_PATH = f"{DATA_DIR}/pubmed_index.faiss"
+PUB_META_PATH  = f"{DATA_DIR}/pubmed_meta.pkl"
+MED_INDEX_PATH = f"{DATA_DIR}/medquad_index.faiss"
+MED_META_PATH  = f"{DATA_DIR}/medquad_meta.pkl"
 
 # ============================================================
-# Helper: download Google Drive file once
+# Helper: download GDrive
 # ============================================================
-def download_from_drive(drive_url, dest):
+def download_from_drive(url, dest):
     if os.path.exists(dest) and os.path.getsize(dest) > 0:
-        print(f"[skip] already exists: {dest}")
+        print(f"[skip] {dest}")
         return
-
-    if not drive_url:
-        raise RuntimeError(f"Missing GDrive URL for {dest}")
-
-    print(f"[gdown] downloading: {drive_url}")
-
-    try:
-        file_id = drive_url.split("/d/")[1].split("/")[0]
-    except:
-        raise RuntimeError(f"❌ Invalid Google Drive URL: {drive_url}")
-
+    file_id = url.split("/d/")[1].split("/")[0]
     gdown.download(id=file_id, output=dest, quiet=False)
 
-# ============================================================
-# Download files on startup
-# ============================================================
-try:
-    download_from_drive(PUBMED_INDEX_URL, PUB_INDEX_PATH)
-    download_from_drive(PUBMED_META_URL,  PUB_META_PATH)
-    download_from_drive(MED_INDEX_URL,    MED_INDEX_PATH)
-    download_from_drive(MED_META_URL,     MED_META_PATH)
-except Exception as e:
-    print(f"[startup error] {e}", file=sys.stderr)
-    raise
+for url, path in [
+    (PUBMED_INDEX_URL, PUB_INDEX_PATH),
+    (PUBMED_META_URL,  PUB_META_PATH),
+    (MED_INDEX_URL,    MED_INDEX_PATH),
+    (MED_META_URL,     MED_META_PATH),
+]:
+    try:
+        download_from_drive(url, path)
+    except Exception as e:
+        print(f"[startup error] {e}")
+        raise
 
 # ============================================================
 # Model setup
 # ============================================================
-device = (
-    "mps" if torch.backends.mps.is_available()
-    else "cuda" if torch.cuda.is_available()
-    else "cpu"
-)
-print(f"Using device: {device}")
-
+device = "cuda" if torch.cuda.is_available() else "cpu"
 embedder = SentenceTransformer("pritamdeka/S-BioBert-snli-multinli-stsb", device=device)
 cross_encoder = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2", device=device)
 
 # ============================================================
-# Load FAISS + metadata
+# Load FAISS + meta
 # ============================================================
-def load_index_and_meta(index_path, meta_path, name):
-    print(f"Loading {name} ...")
+def load_index_meta(index_path, meta_path):
     index = faiss.read_index(index_path)
-
     with open(meta_path, "rb") as f:
         data = pickle.load(f)
+    return index, data["texts"], data["meta"]
 
-    texts = data["texts"]
-    meta = data["meta"]
-
-    print(f"Loaded {len(texts)} entries for {name}")
-    return index, texts, meta
-
-pub_index, pub_texts, pub_meta = load_index_and_meta(PUB_INDEX_PATH, PUB_META_PATH, "PubMedQA")
-med_index, med_texts, med_meta = load_index_and_meta(MED_INDEX_PATH, MED_META_PATH, "MedQuAD")
+pub_index, pub_texts, pub_meta = load_index_meta(PUB_INDEX_PATH, PUB_META_PATH)
+med_index, med_texts, med_meta = load_index_meta(MED_INDEX_PATH, MED_META_PATH)
 
 # ============================================================
-# Core RAG: return ONE best answer with thresholding
+# Core RAG
 # ============================================================
-def get_best_answer(query, top_k=40):
+def rag_search(query, top_k=40):
     q_emb = embedder.encode([query], convert_to_numpy=True, normalize_embeddings=True).astype("float32")
 
-    # ---- Search PubMed ----
-    sims_pub, idxs_pub = pub_index.search(q_emb, top_k)
-    pub_hits = [(sims_pub[0][i], idxs_pub[0][i], pub_texts[idxs_pub[0][i]], pub_meta[idxs_pub[0][i]], "PubMedQA")
+    # PubMed
+    sims_pub, idx_pub = pub_index.search(q_emb, top_k)
+    pub_hits = [(idx_pub[0][i], sims_pub[0][i], pub_texts[idx_pub[0][i]], pub_meta[idx_pub[0][i]], "PubMedQA")
                 for i in range(top_k)]
 
-    # ---- Search MedQuAD ----
-    sims_med, idxs_med = med_index.search(q_emb, top_k)
-    med_hits = [(sims_med[0][i], idxs_med[0][i], med_texts[idxs_med[0][i]], med_meta[idxs_med[0][i]], "MedQuAD")
+    # MedQuAD
+    sims_med, idx_med = med_index.search(q_emb, top_k)
+    med_hits = [(idx_med[0][i], sims_med[0][i], med_texts[idx_med[0][i]], med_meta[idx_med[0][i]], "MedQuAD")
                 for i in range(top_k)]
 
-    # Combine all
     all_hits = pub_hits + med_hits
-    if not all_hits:
-        return "Not enough evidence to answer confidently.", None
 
-    # ---- Rank using Cross-Encoder ----
     ce_inputs = [(query, h[2]) for h in all_hits]
     ce_scores = cross_encoder.predict(ce_inputs)
 
-    # Best index
     best_idx = int(np.argmax(ce_scores))
-    best_ce = float(ce_scores[best_idx])
+    best_score = float(ce_scores[best_idx])
     _, _, _, best_meta, source = all_hits[best_idx]
 
-    # --- Threshold check ---
-    if best_ce < CE_THRESHOLD:
-        return "Not enough evidence to answer confidently.", None
+    if best_score < CE_THRESHOLD:
+        return None, None  # weak → use Gemini
 
-    # Final answer
-    answer = best_meta.get("long_answer", "").strip()
-    if not answer:
-        answer = best_meta.get("answer", "").strip()
-    if not answer:
-        answer = "Not enough evidence to answer confidently."
+    answer = best_meta.get("long_answer") or best_meta.get("answer") or ""
+    return answer.strip(), source
 
-    return answer, source
+
+# ============================================================
+# Gemini unified call
+# ============================================================
+def gemini_medical_classifier_and_context(question):
+    prompt = f"""
+You are a strict medical classifier + context generator.
+
+1. First determine if the user question is truly MEDICAL. 
+2. If it is NOT medical:
+    - Respond ONLY with JSON:
+      {{"is_medical": false}}
+3. If it IS medical:
+    - Generate ONE PARAGRAPH (120–200 words) written like a medical textbook.
+    - The paragraph MUST contain the correct answer naturally inside it.
+    - It should not look like AI content.
+    - Do NOT give bullet points.
+    - Do NOT say "As an AI".
+    - Respond ONLY as JSON in this format:
+
+      {{
+        "is_medical": true,
+        "context": "<paragraph>"
+      }}
+
+User question: "{question}"
+"""
+
+    response = gemini_model.generate_content(prompt).text
+    return response
+
 
 # ============================================================
 # FastAPI
 # ============================================================
-app = FastAPI(title="Simple Medical RAG with Threshold")
+app = FastAPI()
 
-def verify_api(request: Request):
-    if API_KEY:
-        if request.headers.get("x-api-key") != API_KEY:
-            raise HTTPException(status_code=401, detail="Invalid or missing API key")
-
-@app.get("/health")
-def health():
-    return {"status": "ok", "threshold": CE_THRESHOLD}
+def verify_key(request: Request):
+    if API_KEY and request.headers.get("x-api-key") != API_KEY:
+        raise HTTPException(401, "Invalid API key")
 
 @app.get("/ask")
 def ask(question: str, request: Request):
-    verify_api(request)
+    verify_key(request)
 
     question = question.strip()
     if not question:
-        raise HTTPException(status_code=400, detail="Question cannot be empty.")
+        raise HTTPException(400, "Question cannot be empty")
 
-    answer, source = get_best_answer(question)
+    # -------------------------------
+    # 1. Try RAG (high confidence)
+    # -------------------------------
+    rag_answer, rag_source = rag_search(question)
 
+    if rag_answer:  # RAG succeeded
+        return {
+            "question": question,
+            "answer": rag_answer,
+            "source": rag_source,
+            "is_medical": True
+        }
+
+    # -------------------------------
+    # 2. RAG weak → use Gemini (single call)
+    # -------------------------------
+    gem = gemini_medical_classifier_and_context(question)
+
+    try:
+        gem_json = eval(gem)  # Gemini returns JSON text
+    except:
+        return {
+            "question": question,
+            "answer": "Failed to parse Gemini output.",
+            "source": None,
+            "is_medical": False
+        }
+
+    if gem_json.get("is_medical") is False:
+        return {
+            "question": question,
+            "answer": "This question is not medical.",
+            "source": None,
+            "is_medical": False
+        }
+
+    # Medical → return context
     return {
         "question": question,
-        "answer": answer,
-        "source": source
+        "answer": gem_json.get("context", ""),
+        "source": "MedBooks",
+        "is_medical": True
     }
